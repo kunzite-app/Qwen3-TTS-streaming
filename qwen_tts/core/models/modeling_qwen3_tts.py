@@ -3070,6 +3070,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         total_frames_emitted: list[int] = [0] * B
         generated_token_ids: list[list[int]] = [[] for _ in range(B)]
         finished: list[bool] = [False] * B
+        sr = 24000  # default sample rate, updated on first decode
 
         # Shared frame counter (items advance in lockstep)
         frames_since_emit = 0
@@ -3163,31 +3164,57 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             blend_samples = overlap_samples
             chunks_list: list[np.ndarray] = []
 
+            # Phase 1: Collect windows for all active items
+            active_indices: list[int] = []
+            active_windows: list[torch.Tensor] = []
+
             for b in range(B):
                 if finished[b] or len(codes_buffers[b]) == 0:
-                    chunks_list.append(np.array([], dtype=np.float32))
                     continue
-
-                # Decode window for this item
                 start = max(0, len(codes_buffers[b]) - current_decode_window)
                 window_codes = torch.stack(codes_buffers[b][start:], dim=0)
-
-                # Add per-item ref_code context
                 window, _ = _add_ref_code_context(
                     window_codes, ref_code_contexts[b], ref_code_frames_list[b], current_decode_window
                 )
+                active_indices.append(b)
+                active_windows.append(window)
 
-                # Decode (each item independently through compiled decoder)
-                if current_use_optimized and hasattr(self.speech_tokenizer, 'decode_streaming'):
-                    wavs, sr = self.speech_tokenizer.decode_streaming(
-                        window.to(self.talker.device),
+            # Phase 2: Batched decode (single GPU call for all active items)
+            active_wavs: dict[int, np.ndarray] = {}
+            if active_windows:
+                # Pad all windows to same length and stack into batch
+                max_t = max(w.shape[0] for w in active_windows)
+                padded_windows = []
+                for w in active_windows:
+                    if w.shape[0] < max_t:
+                        pad = torch.zeros(max_t - w.shape[0], w.shape[1], dtype=w.dtype, device=w.device)
+                        padded_windows.append(torch.cat([pad, w], dim=0))
+                    else:
+                        padded_windows.append(w)
+                batch_codes = torch.stack(padded_windows, dim=0).to(self.talker.device)  # [B_active, max_t, Q]
+
+                if current_use_optimized and hasattr(self.speech_tokenizer, 'decode_streaming_batch'):
+                    batch_wavs, sr = self.speech_tokenizer.decode_streaming_batch(
+                        batch_codes,
                         use_optimized=True,
                         pad_to_size=decode_window_frames,
                     )
                 else:
-                    wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+                    batch_wavs = []
+                    for i in range(batch_codes.shape[0]):
+                        wavs_i, sr = self.speech_tokenizer.decode([{"audio_codes": batch_codes[i]}])
+                        batch_wavs.append(wavs_i[0])
 
-                wav = wavs[0].astype(np.float32)
+                for idx, b in enumerate(active_indices):
+                    active_wavs[b] = batch_wavs[idx].astype(np.float32)
+
+            # Phase 3: Per-item post-processing (crossfade, fade-in, trim)
+            for b in range(B):
+                if b not in active_wavs:
+                    chunks_list.append(np.array([], dtype=np.float32))
+                    continue
+
+                wav = active_wavs[b]
                 chunk = wav[-step_samples:] if step_samples > 0 else wav
 
                 # Crossfade with previous chunk tail
@@ -3215,14 +3242,19 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             yield chunks_list, sr
 
-        # Flush: decode remaining per-item frames
+        # Flush: decode remaining per-item frames (batched)
         flush_chunks: list[np.ndarray] = []
         flush_sr = 24000  # default
+
+        # Phase 1: Collect flush windows and per-item metadata
+        flush_active_indices: list[int] = []
+        flush_active_windows: list[torch.Tensor] = []
+        flush_skip_frames: list[int] = []
+        flush_window_lengths: list[int] = []
 
         for b in range(B):
             remaining_frames = len(codes_buffers[b]) - total_frames_emitted[b]
             if remaining_frames <= 0:
-                flush_chunks.append(np.array([], dtype=np.float32))
                 continue
 
             context_frames = min(total_frames_emitted[b], decode_window_frames - remaining_frames)
@@ -3233,13 +3265,59 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 window_codes, ref_code_contexts[b], ref_code_frames_list[b], decode_window_frames
             )
 
-            wavs, flush_sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
-            wav = wavs[0].astype(np.float32)
+            flush_active_indices.append(b)
+            flush_active_windows.append(window)
+            flush_skip_frames.append(flush_ref_prefix_frames + context_frames)
+            flush_window_lengths.append(window.shape[0])
 
-            skip_frames = flush_ref_prefix_frames + context_frames
-            if skip_frames > 0:
-                samples_per_frame = len(wav) / window.shape[0]
-                skip_samples = int(skip_frames * samples_per_frame)
+        # Phase 2: Batched decode
+        flush_active_wavs: dict[int, np.ndarray] = {}
+        if flush_active_windows:
+            max_t = max(w.shape[0] for w in flush_active_windows)
+            padded_windows = []
+            for w in flush_active_windows:
+                if w.shape[0] < max_t:
+                    pad = torch.zeros(max_t - w.shape[0], w.shape[1], dtype=w.dtype, device=w.device)
+                    padded_windows.append(torch.cat([pad, w], dim=0))
+                else:
+                    padded_windows.append(w)
+            batch_codes = torch.stack(padded_windows, dim=0).to(self.talker.device)
+
+            if hasattr(self.speech_tokenizer, 'decode_streaming_batch'):
+                batch_wavs, flush_sr = self.speech_tokenizer.decode_streaming_batch(
+                    batch_codes,
+                    use_optimized=True,
+                    pad_to_size=decode_window_frames,
+                )
+            else:
+                batch_wavs = []
+                for i in range(batch_codes.shape[0]):
+                    wavs_i, flush_sr = self.speech_tokenizer.decode([{"audio_codes": batch_codes[i]}])
+                    batch_wavs.append(wavs_i[0])
+
+            for idx, b in enumerate(flush_active_indices):
+                flush_active_wavs[b] = batch_wavs[idx].astype(np.float32)
+
+        # Phase 3: Per-item post-processing (skip, crossfade, fade-out)
+        for b in range(B):
+            if b not in flush_active_wavs:
+                flush_chunks.append(np.array([], dtype=np.float32))
+                continue
+
+            wav = flush_active_wavs[b]
+            idx_in_active = flush_active_indices.index(b)
+            skip = flush_skip_frames[idx_in_active]
+            win_len = flush_window_lengths[idx_in_active]
+
+            # Account for batch left-padding: items padded from win_len to max_t
+            # have extra decoded samples at the front that need skipping
+            max_t_flush = max(w.shape[0] for w in flush_active_windows) if flush_active_windows else win_len
+            batch_pad_frames = max_t_flush - win_len
+            total_skip = skip + batch_pad_frames
+
+            if total_skip > 0:
+                samples_per_frame = len(wav) / max_t_flush
+                skip_samples = int(total_skip * samples_per_frame)
                 wav = wav[skip_samples:]
 
             blend_samples = overlap_samples
