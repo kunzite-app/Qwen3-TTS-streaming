@@ -56,9 +56,9 @@ class Qwen3TTSModel:
     A HuggingFace-style wrapper for Qwen3 TTS models (CustomVoice/VoiceDesign/Base) that provides:
       - from_pretrained() initialization via AutoModel/AutoProcessor
       - generation APIs for:
-          * CustomVoice: generate_custom_voice()
+          * CustomVoice: generate_custom_voice() / stream_generate_custom_voice()
           * VoiceDesign: generate_voice_design()
-          * Base: generate_voice_clone() + create_voice_clone_prompt()
+          * Base: generate_voice_clone() / stream_generate_voice_clone() + create_voice_clone_prompt()
       - consistent output: (wavs: List[np.ndarray], sample_rate: int)
 
     Notes:
@@ -163,6 +163,13 @@ class Qwen3TTSModel:
 
             # Now streaming will be faster
             for chunk, sr in model.stream_generate_voice_clone(..., decode_window_frames=80):
+                ...
+
+            # Also works with CustomVoice models:
+            model = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", ...)
+            model.enable_streaming_optimizations(decode_window_frames=80)
+
+            for chunk, sr in model.stream_generate_custom_voice(..., decode_window_frames=80):
                 ...
         """
         self.model.enable_streaming_optimizations(
@@ -1013,6 +1020,93 @@ class Qwen3TTSModel:
         wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
         return wavs, fs
 
+    @torch.inference_mode()
+    def stream_generate_custom_voice(
+        self,
+        text: str,
+        speaker: str,
+        language: str = None,
+        instruct: Optional[str] = None,
+        non_streaming_mode: bool = False,
+        # Streaming control
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 0,
+        max_frames: int = 10000,
+        # Optimization
+        use_optimized_decode: bool = True,
+        **kwargs,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        """
+        Stream CustomVoice speech generation, yielding PCM chunks as they are generated.
+
+        NOTE: This method only supports single-sample generation (no batching).
+
+        Args:
+            text: Text to synthesize (single string only).
+            speaker: Speaker name. Validated against model.get_supported_speakers().
+            language: Language for synthesis.
+            instruct: Optional instruction describing desired style/emotion.
+            non_streaming_mode: Whether to use non-streaming text input mode.
+            emit_every_frames: Emit PCM chunk every N codec frames.
+            decode_window_frames: Window size for decoding (longer = better quality, more latency).
+            overlap_samples: Overlap samples for crossfade between chunks.
+            max_frames: Maximum codec frames to generate.
+            use_optimized_decode: Use CUDA graph optimized decode when available (default True).
+                                  Call enable_streaming_optimizations() first for best performance.
+            **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
+
+        Yields:
+            Tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
+        """
+        if self.model.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support stream_generate_custom_voice"
+            )
+
+        if isinstance(text, list):
+            raise ValueError("stream_generate_custom_voice only supports single text, not batch")
+
+        texts = [text]
+        languages = [language if language is not None else "Auto"]
+        speakers = [speaker]
+
+        if self.model.tts_model_size in "0b6":
+            instruct = None
+
+        self._validate_languages(languages)
+        self._validate_speakers(speakers)
+
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+
+        instruct_ids: List[Optional[torch.Tensor]] = []
+        if instruct is None or instruct == "":
+            instruct_ids.append(None)
+        else:
+            instruct_ids.append(self._tokenize_texts([self._build_instruct_text(instruct)])[0])
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+
+        for chunk, sr in self.model.stream_generate_pcm(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            languages=languages,
+            speakers=speakers,
+            non_streaming_mode=non_streaming_mode,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            **gen_kwargs,
+        ):
+            yield chunk, sr
 
     def get_supported_speakers(self) -> Optional[List[str]]:
         """

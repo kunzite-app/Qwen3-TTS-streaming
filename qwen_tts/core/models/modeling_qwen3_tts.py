@@ -93,12 +93,21 @@ def _sample_next_token(
 
 
 def _crossfade(prev_tail: np.ndarray, new_head: np.ndarray) -> np.ndarray:
-    """Crossfade between end of previous chunk and start of new chunk."""
+    """Crossfade between end of previous chunk and start of new chunk using a Hann window.
+
+    A Hann window produces a smooth, cosine-shaped fade that eliminates
+    discontinuities at chunk boundaries more effectively than a linear ramp.
+    The fade-in curve is the rising half of the Hann window and the fade-out
+    is its complement, guaranteeing constant-power overlap-add reconstruction.
+    """
     n = min(len(prev_tail), len(new_head))
     if n <= 0:
         return new_head
-    w = np.linspace(0.0, 1.0, n, dtype=np.float32)
-    return prev_tail[:n] * (1.0 - w) + new_head[:n] * w
+    # Full Hann window of length 2n; second half is the fade-in curve
+    hann = np.hanning(2 * n).astype(np.float32)
+    fade_in = hann[n:]       # rising half: 0 → 1
+    fade_out = 1.0 - fade_in  # falling half: 1 → 0
+    return prev_tail[:n] * fade_out + new_head[:n] * fade_in
 
 
 def _add_ref_code_context(
