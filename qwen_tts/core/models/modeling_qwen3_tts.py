@@ -93,12 +93,21 @@ def _sample_next_token(
 
 
 def _crossfade(prev_tail: np.ndarray, new_head: np.ndarray) -> np.ndarray:
-    """Crossfade between end of previous chunk and start of new chunk."""
+    """Crossfade between end of previous chunk and start of new chunk using a Hann window.
+
+    A Hann window produces a smooth, cosine-shaped fade that eliminates
+    discontinuities at chunk boundaries more effectively than a linear ramp.
+    The fade-in curve is the rising half of the Hann window and the fade-out
+    is its complement, guaranteeing constant-power overlap-add reconstruction.
+    """
     n = min(len(prev_tail), len(new_head))
     if n <= 0:
         return new_head
-    w = np.linspace(0.0, 1.0, n, dtype=np.float32)
-    return prev_tail[:n] * (1.0 - w) + new_head[:n] * w
+    # Full Hann window of length 2n; second half is the fade-in curve
+    hann = np.hanning(2 * n).astype(np.float32)
+    fade_in = hann[n:]       # rising half: 0 → 1
+    fade_out = 1.0 - fade_in  # falling half: 1 → 0
+    return prev_tail[:n] * fade_out + new_head[:n] * fade_in
 
 
 def _add_ref_code_context(
@@ -2551,6 +2560,17 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         repetition_penalty: float = 1.05,
         **kwargs,
     ):
+        # Multiple EOS tokens that can terminate generation
+        eos_ids = {
+            self.config.talker_config.codec_eos_token_id,  # Primary codec EOS
+            2150,    # Codec EOS (model-specific)
+            2157,    # Secondary codec token
+            151670,  # TTS special token
+            self.config.tts_eos_token_id,   # 151673
+            self.config.im_end_token_id,    # 151645
+            151643,  # <|endoftext|>
+        }
+
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
             "min_new_tokens": 2,
@@ -2558,7 +2578,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "top_k": top_k,
             "top_p": top_p,
             "temperature": temperature,
-            "subtalker_dosample": subtalker_dosample, 
+            "subtalker_dosample": subtalker_dosample,
             "subtalker_top_k": subtalker_top_k,
             "subtalker_top_p": subtalker_top_p,
             "subtalker_temperature": subtalker_temperature,
@@ -2569,7 +2589,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "suppress_tokens": [
                 i
                 for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
-                if i not in (self.config.talker_config.codec_eos_token_id,)
+                if i not in eos_ids
             ],
             "output_hidden_states": kwargs.get("output_hidden_states", True),
             "return_dict_in_generate": kwargs.get("return_dict_in_generate", True)
@@ -2600,7 +2620,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         talker_hidden_states = torch.cat([hid[0][-1][:, -1:] for hid in talker_result.hidden_states], dim=1)[:, :-1]
         
         first_codebook = talker_codes[:, :, 0]
-        is_stop_token = (first_codebook ==  self.config.talker_config.codec_eos_token_id)
+        # Check against all EOS tokens
+        eos_ids_tensor = torch.tensor(list(eos_ids), device=first_codebook.device, dtype=first_codebook.dtype)
+        is_stop_token = torch.isin(first_codebook, eos_ids_tensor)
         stop_indices = torch.argmax(is_stop_token.int(), dim=1)
         has_stop_token = is_stop_token.any(dim=1)
         effective_lengths = torch.where(has_stop_token, stop_indices, talker_codes.shape[1])
@@ -2637,6 +2659,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         max_frames: int = 10000,
         # Optimization flags
         use_optimized_decode: bool = True,
+        # Two-phase streaming: aggressive first chunk
+        first_chunk_emit_every: int = 0,  # 0 = disabled, use emit_every_frames throughout
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,  # Switch to stable after this many frames
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2659,6 +2685,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             overlap_samples: Overlap samples for crossfade between chunks
             max_frames: Maximum number of codec frames to generate
             use_optimized_decode: Use CUDA graph optimized decode when available (default True)
+            first_chunk_emit_every: Emit interval for first chunk phase (0 = disabled, use emit_every_frames)
+            first_chunk_decode_window: Decode window size for first chunk phase
+            first_chunk_frames: Switch to stable settings after this many frames
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2675,13 +2704,23 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 non_streaming_mode=non_streaming_mode,
             )
 
-        eos_id = self.config.talker_config.codec_eos_token_id
+        # Multiple EOS tokens that can terminate generation
+        # Some models may emit different EOS tokens depending on context
+        eos_ids = {
+            self.config.talker_config.codec_eos_token_id,  # Primary codec EOS
+            2150,    # Codec EOS (model-specific)
+            2157,    # Secondary codec token
+            151670,  # TTS special token
+            self.config.tts_eos_token_id,   # 151673
+            self.config.im_end_token_id,    # 151645
+            151643,  # <|endoftext|>
+        }
 
         # Build suppress_tokens list (same as in generate())
         vocab_size = self.config.talker_config.vocab_size
         suppress_tokens = [
             i for i in range(vocab_size - 1024, vocab_size)
-            if i != eos_id
+            if i not in eos_ids
         ]
 
         # Mark step begin for CUDA graphs (required for torch.compile with reduce-overhead)
@@ -2767,9 +2806,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Get codec_ids from hidden_states tuple: (layer_outputs, codec_ids)
             codec_ids = step_out.hidden_states[1]  # [B, num_code_groups]
 
-            # Check for EOS in first codebook ON GPU (avoids CPU sync bottleneck)
+            # Check for EOS in first codebook
             # EOS token is out of range for speech tokenizer, so we must not include it
-            if codec_ids[0, 0] == eos_id:
+            if codec_ids[0, 0].item() in eos_ids:
                 break
 
             # Keep on GPU to avoid CPU<->GPU transfers during decode
@@ -2783,22 +2822,36 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 token = torch.argmax(step_logits, dim=-1)
 
             frames_since_emit += 1
-            if frames_since_emit < emit_every_frames:
+
+            # Two-phase streaming: determine current phase settings
+            total_frames_generated = len(codes_buffer)
+            if first_chunk_emit_every > 0 and total_frames_generated < first_chunk_frames:
+                # Phase 1: Aggressive settings for first chunk (lower latency)
+                current_emit_every = first_chunk_emit_every
+                current_decode_window = first_chunk_decode_window
+                current_use_optimized = False  # Non-optimized allows flexible window size
+            else:
+                # Phase 2: Stable settings (better quality)
+                current_emit_every = emit_every_frames
+                current_decode_window = decode_window_frames
+                current_use_optimized = use_optimized_decode
+
+            if frames_since_emit < current_emit_every:
                 continue
             frames_since_emit = 0
 
             # Decode window of codec frames to PCM
-            start = max(0, len(codes_buffer) - decode_window_frames)
+            start = max(0, len(codes_buffer) - current_decode_window)
             window_codes = torch.stack(codes_buffer[start:], dim=0)  # [T, num_code_groups]
 
             # Add ref_code as context prefix for stable decoder context from the start
             window, _ = _add_ref_code_context(
-                window_codes, ref_code_context, ref_code_frames, decode_window_frames
+                window_codes, ref_code_context, ref_code_frames, current_decode_window
             )
 
             # Use optimized decode path when available
             # Pass pad_to_size to ensure fixed tensor size for torch.compile
-            if use_optimized_decode and hasattr(self.speech_tokenizer, 'decode_streaming'):
+            if current_use_optimized and hasattr(self.speech_tokenizer, 'decode_streaming'):
                 wavs, sr = self.speech_tokenizer.decode_streaming(
                     window.to(self.talker.device),
                     use_optimized=True,
@@ -2813,7 +2866,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Extract only new samples (tail of decoded window)
             # Use fixed upsample rate to avoid floating-point drift
             samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
-            step_samples = samples_per_frame * emit_every_frames
+            step_samples = samples_per_frame * current_emit_every
             chunk = wav[-step_samples:] if step_samples > 0 else wav
 
             # Crossfade with previous chunk tail for smooth transition
@@ -2856,6 +2909,15 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 if ov > 0:
                     head = _crossfade(decoded_tail[-ov:], wav[:ov])
                     wav = np.concatenate([head, wav[ov:]], axis=0)
+
+            blend_samples = overlap_samples
+
+            # Apply fade-out at very end of audio to avoid pop on completion
+            if blend_samples > 0 and len(wav) > blend_samples:
+                fade_len = min(blend_samples, len(wav))
+                t = np.arange(fade_len, dtype=np.float32) / max(fade_len - 1, 1)
+                fade_out = 0.5 * (1 + np.cos(np.pi * t))
+                wav[-fade_len:] *= fade_out
 
             # Debug removed for performance: flush done
             yield wav, sr
