@@ -133,6 +133,33 @@ def test_base_eos(device: str) -> None:
     )
 
 
+def test_zero_overlap_flush(device: str) -> None:
+    model = load_model(BASE_MODEL, device)
+    prompt_items = model.create_voice_clone_prompt(ref_audio=str(REF_AUDIO), ref_text=REF_TEXT)
+
+    chunk_count, sample_count, sample_rate = collect_stream(
+        model.stream_generate_voice_clone(
+            text="Tiny zero-overlap flush test.",
+            language="English",
+            voice_clone_prompt=prompt_items,
+            emit_every_frames=2,
+            decode_window_frames=24,
+            overlap_samples=0,
+            max_frames=24,
+            do_sample=False,
+            subtalker_dosample=False,
+            use_optimized_decode=False,
+            first_chunk_emit_every=2,
+            first_chunk_decode_window=24,
+            first_chunk_frames=8,
+        )
+    )
+    print(
+        f"zero_overlap_flush_ok device={device} chunks={chunk_count} "
+        f"samples={sample_count} sr={sample_rate}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default=pick_device())
@@ -142,6 +169,7 @@ def main() -> None:
     test_custom_voice(args.device)
     test_base_overlap(args.device)
     test_base_eos(args.device)
+    test_zero_overlap_flush(args.device)
 
 
 if __name__ == "__main__":
