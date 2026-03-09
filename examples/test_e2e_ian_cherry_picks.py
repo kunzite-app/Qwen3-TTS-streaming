@@ -71,6 +71,9 @@ def test_custom_voice(device: str) -> None:
             do_sample=False,
             subtalker_dosample=False,
             use_optimized_decode=False,
+            first_chunk_emit_every=2,
+            first_chunk_decode_window=24,
+            first_chunk_frames=8,
         )
     )
     print(
@@ -95,10 +98,37 @@ def test_base_overlap(device: str) -> None:
             do_sample=False,
             subtalker_dosample=False,
             use_optimized_decode=False,
+            first_chunk_emit_every=2,
+            first_chunk_decode_window=24,
+            first_chunk_frames=8,
         )
     )
     print(
         f"base_overlap_stream_ok device={device} chunks={chunk_count} "
+        f"samples={sample_count} sr={sample_rate}"
+    )
+
+
+def test_base_eos(device: str) -> None:
+    model = load_model(BASE_MODEL, device)
+    prompt_items = model.create_voice_clone_prompt(ref_audio=str(REF_AUDIO), ref_text=REF_TEXT)
+
+    chunk_count, sample_count, sample_rate = collect_stream(
+        model.stream_generate_voice_clone(
+            text="Hello.",
+            language="English",
+            voice_clone_prompt=prompt_items,
+            emit_every_frames=2,
+            decode_window_frames=24,
+            overlap_samples=0,
+            max_frames=32,
+            do_sample=False,
+            subtalker_dosample=False,
+            use_optimized_decode=False,
+        )
+    )
+    print(
+        f"base_eos_stream_ok device={device} chunks={chunk_count} "
         f"samples={sample_count} sr={sample_rate}"
     )
 
@@ -111,6 +141,7 @@ def main() -> None:
     print(f"using_device={args.device}")
     test_custom_voice(args.device)
     test_base_overlap(args.device)
+    test_base_eos(args.device)
 
 
 if __name__ == "__main__":
